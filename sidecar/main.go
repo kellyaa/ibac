@@ -214,6 +214,69 @@ func resolveSessionID(state *streamState) string {
 	return ""
 }
 
+// extractA2AIntent pulls the user's natural-language intent from an A2A JSON-RPC
+// message/send request body. A2A nests the text at params.message.parts[*].text
+// (where each part is {"kind":"text","text":"..."}). Returns (text, true) when a
+// text part is found; concatenates all text parts with "\n" separators.
+func extractA2AIntent(reqBody map[string]interface{}) (string, bool) {
+	params, ok := reqBody["params"].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	message, ok := params["message"].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	parts, ok := message["parts"].([]interface{})
+	if !ok {
+		return "", false
+	}
+	var texts []string
+	for _, p := range parts {
+		part, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// Skip non-text parts (file, data).
+		if kind, _ := part["kind"].(string); kind != "" && kind != "text" {
+			continue
+		}
+		if text, ok := part["text"].(string); ok && text != "" {
+			texts = append(texts, text)
+		}
+	}
+	if len(texts) == 0 {
+		return "", false
+	}
+	return strings.Join(texts, "\n"), true
+}
+
+// isMCPProtocolCall returns true for MCP POSTs that are framing calls, not
+// user-initiated tool invocations. These occur during agent startup before any
+// user session exists and shouldn't be blocked for "no session ID".
+//
+// POST /mcp with method ∈ {initialize, notifications/*, ping, tools/list,
+// resources/list, prompts/list} is considered framing; method=tools/call and
+// anything unrecognized falls through to normal session+LLM validation.
+//
+// GET/DELETE /mcp (SSE stream, session close) don't emit RequestBody events
+// and never reach this check.
+func isMCPProtocolCall(method, path, body string) bool {
+	if method != "POST" || path != "/mcp" || body == "" {
+		return false
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		return false
+	}
+	rpcMethod, _ := req["method"].(string)
+	switch rpcMethod {
+	case "initialize", "ping", "tools/list", "resources/list", "prompts/list":
+		return true
+	}
+	return strings.HasPrefix(rpcMethod, "notifications/")
+}
+
 // formatSessionContext renders session events as a numbered list for the LLM prompt
 func formatSessionContext(sc *SessionContext) string {
 	sc.mu.Lock()
@@ -432,7 +495,12 @@ func (p *processor) Process(stream v3.ExternalProcessor_ProcessServer) error {
 				// Inbound: capture the user's intent from the request body
 				var reqBody map[string]interface{}
 				if err := json.Unmarshal([]byte(body), &reqBody); err == nil {
-					if query, ok := reqBody["query"].(string); ok && sessionID != "" {
+					query, ok := reqBody["query"].(string)
+					if !ok {
+						// Fall back to A2A JSON-RPC: look at params.message.parts[*].text
+						query, ok = extractA2AIntent(reqBody)
+					}
+					if ok && sessionID != "" {
 						sc := getOrCreateSession(sessionID)
 						sc.mu.Lock()
 						sc.OriginalIntent = query
@@ -451,6 +519,14 @@ func (p *processor) Process(stream v3.ExternalProcessor_ProcessServer) error {
 					if sessionID != "" {
 						getOrCreateSession(sessionID).SetEventAction(state.requestEventIdx, "ALLOW (trusted)")
 					}
+					resp = allowBody()
+				} else if isMCPProtocolCall(state.method, state.path, body) {
+					// MCP housekeeping (initialize, tools/list, session open/close, SSE
+					// stream) happens before any user request establishes a session.
+					// These don't invoke tools on the user's behalf, so they don't
+					// need intent validation. Only method=tools/call proceeds to the
+					// session+LLM check below.
+					log.Printf("[IBAC] ALLOW MCP protocol: %s %s (no intent check)", state.method, state.path)
 					resp = allowBody()
 				} else {
 					// Untrusted destination: validate against session context
