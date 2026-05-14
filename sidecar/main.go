@@ -328,9 +328,18 @@ type IntentDecision struct {
 }
 
 // loadPromptTemplate reads the intent prompt template from a file.
-// It looks for intent_prompt.txt next to the binary first, then falls back to the current directory.
+//
+// Search order:
+//  1. INTENT_PROMPT_PATH env var, if set (allows operators to mount a custom
+//     prompt as a ConfigMap volume without rebuilding the image).
+//  2. intent_prompt.txt next to the binary.
+//  3. sidecar/intent_prompt.txt for local dev.
 func loadPromptTemplate() string {
-	paths := []string{"intent_prompt.txt", "sidecar/intent_prompt.txt"}
+	paths := []string{}
+	if p := os.Getenv("INTENT_PROMPT_PATH"); p != "" {
+		paths = append(paths, p)
+	}
+	paths = append(paths, "intent_prompt.txt", "sidecar/intent_prompt.txt")
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err == nil {
